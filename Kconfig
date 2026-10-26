@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 siakinnik
+menu "smart-core"
+
+    config SMART_MAX_PROPS
+        int "Maximum number of properties"
+        range 1 254
+        default 24
+
+    config SMART_MAX_SESSIONS
+        int "Maximum simultaneous sessions (USB + TCP hosts)"
+        range 1 16
+        default 4
+
+    config SMART_MAX_PAYLOAD
+        int "Maximum packet payload, bytes"
+        range 32 1024
+        default 240
+
+    config SMART_ENABLE_DESCRIBE
+        bool "Answer DESCRIBE (self-description for models the host doesn't know)"
+        default y
+
+    config SMART_ENABLE_SECURE
+        bool "Secure sessions and pairing on untrusted transports (Noise)"
+        default y
+        help
+            Untrusted sessions (TCP, ...) must complete a Noise handshake as a
+            paired host. Turn off only for devices that never sit on a network.
+
+    config SMART_MAX_PAIRED
+        int "Maximum number of paired hosts"
+        range 1 32
+        default 8
+        depends on SMART_ENABLE_SECURE
+
+endmenu

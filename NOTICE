@@ -1,0 +1,17 @@
+smart-core
+Copyright (c) 2026 siakinnik
+Licensed under the GNU General Public License v3.0 or later (see LICENSE).
+
+This project includes third-party code:
+
+third_party/monocypher/  Monocypher 4.0.3, https://monocypher.org
+    Copyright (c) 2017-2023 Loup Vaillant, Michael Savage, Fabio Scotoni
+    Dual-licensed BSD-2-Clause OR CC0-1.0 (see third_party/monocypher/LICENCE.md).
+    smart-core uses it under CC0-1.0; the BSD-2-Clause notice is kept in
+    the sources and in LICENCE.md all the same.
+
+Python dependencies (not included, installed separately):
+    cryptography  Apache-2.0 OR BSD-3-Clause   (secure sessions)
+    pyserial      BSD-3-Clause                 (serial transport)
+    bleak         MIT                          (BLE transport)
+    noiseprotocol MIT                          (optional interop test)
