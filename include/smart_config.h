@@ -28,6 +28,11 @@
 #ifdef CONFIG_SMART_MAX_PAIRED
 #define SMART_MAX_PAIRED CONFIG_SMART_MAX_PAIRED
 #endif
+#ifdef CONFIG_SMART_ENABLE_OTA
+#define SMART_ENABLE_OTA 1
+#else
+#define SMART_ENABLE_OTA 0
+#endif
 #endif
 
 #ifndef SMART_MAX_PROPS
@@ -63,6 +68,11 @@
 
 #ifndef SMART_MAX_PAIRED
 #define SMART_MAX_PAIRED 8              // hosts that may open secure sessions
+#endif
+
+// Signed firmware updates over the protocol (OTA_BEGIN / OTA_DATA / OTA_END).
+#ifndef SMART_ENABLE_OTA
+#define SMART_ENABLE_OTA SMART_ENABLE_SECURE
 #endif
 
 #ifndef SMART_HANDSHAKE_TIMEOUT_MS

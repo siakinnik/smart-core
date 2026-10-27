@@ -16,6 +16,8 @@ the device only tells it how to send bytes and where to store them.
 - **Pairing like Matter / HomeKit.** Over USB, or in a pairing window
   opened by a physical action on the device; the host paired in the window
   may commission the device (give it Wi-Fi) over BLE.
+- **Signed firmware updates.** Over any link; the device installs only
+  images signed with the key its firmware was built with (Ed25519).
 - **Small.** About 5 KB of RAM with 4 sessions and crypto, 760 bytes in
   the smallest configuration; about 38 KB of flash with crypto on an ESP32-C3.
 
@@ -25,11 +27,13 @@ The wire format is in [PROTOCOL.md](PROTOCOL.md).
 
 ```
 include/            smart_core.h (API), smart_config.h (limits), smart_noise.h
-src/                smart_core.c  properties, sessions, messages, pairing
+src/                smart_core.c  properties, sessions, messages, pairing, OTA
                     smart_wire.c  CRC-16 + COBS
                     smart_noise.c Noise XX (only with SMART_ENABLE_SECURE)
-third_party/        Monocypher 4.0.3: X25519, ChaCha20-Poly1305, BLAKE2b
-clients/python/     smart_client.py (host library), smartctl.py (CLI)
+                    smart_image.c signed images: SHA-512, manifest, Ed25519
+third_party/        Monocypher 4.0.3: X25519, ChaCha20-Poly1305, BLAKE2b, Ed25519
+clients/python/     smart_client.py (host library), smartctl.py (CLI),
+                    smartsign.py (signing keys and signed images)
 tests/              C unit tests, an emulator, Python end-to-end tests
 ```
 
@@ -51,11 +55,12 @@ target_link_libraries(my_app PRIVATE smart_core)
 ```
 
 **Anything else** (an Arduino or PlatformIO library, STM32CubeIDE, a
-Makefile): compile these four files as C99 and add `include/` and
+Makefile): compile these files as C99 and add `include/` and
 `third_party/monocypher/` to the include path.
 
 ```
-src/smart_core.c  src/smart_wire.c  src/smart_noise.c  third_party/monocypher/monocypher.c
+src/smart_core.c  src/smart_wire.c  src/smart_noise.c  src/smart_image.c
+third_party/monocypher/monocypher.c  third_party/monocypher/monocypher-ed25519.c
 ```
 
 **A tiny MCU that never sits on a network** (an AVR on a private wire):
@@ -72,6 +77,7 @@ Set with `-D...` (or Kconfig on ESP-IDF).
 | `SMART_MAX_SESSIONS` | 4 | Hosts at once (USB + network) |
 | `SMART_MAX_PAYLOAD` | 240 | Longest packet payload |
 | `SMART_ENABLE_SECURE` | 1 | Noise sessions and pairing on untrusted links |
+| `SMART_ENABLE_OTA` | = SECURE | Signed firmware updates (`ota_begin/write/finish` in the port) |
 | `SMART_MAX_PAIRED` | 8 | Hosts that may be paired |
 | `SMART_ENABLE_DESCRIBE` | 1 | Self-description for models a host doesn't know |
 | `SMART_PERSIST_DELAY_MS` | 3000 | Save persistent properties this long after the last change |
@@ -158,6 +164,23 @@ What the core enforces:
 A complete port with USB, TCP and BLE transports is
 [LumenC3](https://github.com/siakinnik/LumenC3) (`main/smart_esp.c`,
 `main/smart_ble.c`).
+
+## Firmware updates
+
+The device gets the update key and its security version in
+`smart_config_t` (`ota_key`, `security_version`) and three port callbacks
+to write the image (`ota_begin`, `ota_write`, `ota_finish`). The core checks
+the signature, the model, the version and the hash; the port only writes
+and picks the boot slot.
+
+```bash
+python smartsign.py keygen ~/.config/smart-core/mydevice.key   # once; .pub goes into the firmware build
+python smartsign.py sign build/mydevice.bin --key ~/.config/smart-core/mydevice.key --model-id 0x0002
+python smartctl.py tcp:192.168.0.50 update build/mydevice.simg
+```
+
+The private key stays with whoever releases the firmware: never commit it.
+A signed image can also be flashed over USB like a plain one.
 
 ## Host side
 

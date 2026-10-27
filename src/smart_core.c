@@ -13,6 +13,9 @@ enum {
     MSG_PING = 0x05,
     MSG_PAIR = 0x06,
     MSG_UNPAIR = 0x07,
+    MSG_OTA_BEGIN = 0x08,
+    MSG_OTA_DATA = 0x09,
+    MSG_OTA_END = 0x0A,
     MSG_INFO = 0x81,
     MSG_PROP = 0x82,
     MSG_VALUES = 0x83,
@@ -32,7 +35,18 @@ enum {
     ERR_FORBIDDEN = 6,
     ERR_BAD_PROTO = 7,
     ERR_PAIRING_FULL = 8,
+    ERR_BAD_IMAGE = 9,   // OTA: not signed with our key, other model, too old, hash mismatch
+    ERR_BUSY = 10,       // OTA: another host is updating
+    ERR_FLASH = 11,      // OTA: the device couldn't store the image
 };
+
+// INFO flags
+#define INFO_HAS_KEY 0x01  // a device static key follows (secure sessions)
+#define INFO_OTA 0x02      // takes signed updates (OTA_BEGIN ...)
+
+#if SMART_ENABLE_OTA
+static bool ota_supported(const smart_core_t *c);
+#endif
 
 #if SMART_ENABLE_SECURE
 // Frame kinds on an untrusted session (first byte of the frame body)
@@ -390,6 +404,17 @@ static void on_hello(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r)
     w_str(&w, c->device_id);
     w_str(&w, c->model);
     w_str(&w, c->firmware);
+    w_u16(&w, SMART_MAX_PAYLOAD);  // hosts size OTA chunks by it
+    uint8_t flags = 0;
+#if SMART_ENABLE_SECURE
+    if (c->has_key)
+        flags |= INFO_HAS_KEY;
+#endif
+#if SMART_ENABLE_OTA
+    if (ota_supported(c))
+        flags |= INFO_OTA;
+#endif
+    w_u8(&w, flags);
 #if SMART_ENABLE_SECURE
     if (c->has_key)
         w_bytes(&w, c->public_key, 32);  // hosts pin it when pairing over USB
@@ -518,6 +543,119 @@ static void on_set(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r)
     broadcast_event(c, changed, n_changed);
 }
 
+// ---------- firmware updates ----------
+#if SMART_ENABLE_OTA
+#if SMART_MAX_PAYLOAD < SMART_MANIFEST_LEN
+#error "OTA needs SMART_MAX_PAYLOAD >= SMART_MANIFEST_LEN (212)"
+#endif
+
+static bool ota_supported(const smart_core_t *c)
+{
+    return c->ota_key && c->port && c->port->ota_begin && c->port->ota_write && c->port->ota_finish;
+}
+
+static void ota_abort(smart_core_t *c)
+{
+    if (!c->ota.active)
+        return;
+    c->ota.active = false;
+    c->port->ota_finish(c->port->ctx, false);
+}
+
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+// OTA_BEGIN: manifest. Only an image signed with our key, for our model,
+// not older (security-wise) than this firmware, gets this far.
+static void on_ota_begin(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r)
+{
+    smart_manifest_t m;
+    const uint8_t *raw;
+    if (!ota_supported(c)) {
+        send_error(c, s, seq, ERR_UNKNOWN_TYPE, SMART_PROP_NONE);
+        return;
+    }
+    if (r->len != SMART_MANIFEST_LEN || !r_take(r, SMART_MANIFEST_LEN, &raw)) {
+        send_error(c, s, seq, ERR_BAD_LENGTH, SMART_PROP_NONE);
+        return;
+    }
+    if (c->ota.active && c->ota.session != s) {
+        send_error(c, s, seq, ERR_BUSY, SMART_PROP_NONE);
+        return;
+    }
+    ota_abort(c);  // the same host starting over
+    if (!smart_manifest_parse(raw, &m) || !noise_equal32(m.signer, c->ota_key) ||
+        m.model_id != c->model_id || m.security_version < c->security_version || m.image_size == 0) {
+        send_error(c, s, seq, ERR_BAD_IMAGE, SMART_PROP_NONE);
+        return;
+    }
+    if (c->port->ota_begin(c->port->ctx, m.image_size + SMART_MANIFEST_LEN) != 0) {
+        send_error(c, s, seq, ERR_FLASH, SMART_PROP_NONE);
+        return;
+    }
+    c->ota.active = true;
+    c->ota.session = s;
+    c->ota.size = m.image_size;
+    c->ota.offset = 0;
+    memcpy(c->ota.manifest, raw, SMART_MANIFEST_LEN);
+    smart_hash_init(&c->ota.hash);
+    send_simple(c, s, MSG_ACK, seq);
+}
+
+// OTA_DATA: offset (u32), bytes. In order, no gaps, no overlap.
+static void on_ota_data(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r)
+{
+    if (!c->ota.active || c->ota.session != s) {
+        send_error(c, s, seq, ERR_BAD_VALUE, SMART_PROP_NONE);
+        return;
+    }
+    if (r->len < 5) {
+        send_error(c, s, seq, ERR_BAD_LENGTH, SMART_PROP_NONE);
+        return;
+    }
+    uint32_t offset = rd32(r->p);
+    const uint8_t *data = r->p + 4;
+    size_t len = r->len - 4;
+    if (offset != c->ota.offset || len > c->ota.size - offset) {
+        send_error(c, s, seq, ERR_BAD_VALUE, SMART_PROP_NONE);
+        return;
+    }
+    if (c->port->ota_write(c->port->ctx, offset, data, len) != 0) {
+        ota_abort(c);
+        send_error(c, s, seq, ERR_FLASH, SMART_PROP_NONE);
+        return;
+    }
+    smart_hash_update(&c->ota.hash, data, len);
+    c->ota.offset += (uint32_t)len;
+    send_simple(c, s, MSG_ACK, seq);
+}
+
+// OTA_END: the whole image is here; it must hash to what the signature says.
+static void on_ota_end(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r)
+{
+    (void)r;
+    uint8_t hash[64];
+    if (!c->ota.active || c->ota.session != s || c->ota.offset != c->ota.size) {
+        send_error(c, s, seq, ERR_BAD_VALUE, SMART_PROP_NONE);
+        return;
+    }
+    smart_hash_final(&c->ota.hash, hash);
+    if (memcmp(hash, c->ota.manifest + 52, 64) != 0) {  // public data: no need for constant time
+        ota_abort(c);
+        send_error(c, s, seq, ERR_BAD_IMAGE, SMART_PROP_NONE);
+        return;
+    }
+    // the manifest goes right after the image: the installed image stays a signed image
+    c->ota.active = false;
+    if (c->port->ota_write(c->port->ctx, c->ota.size, c->ota.manifest, SMART_MANIFEST_LEN) != 0 ||
+        c->port->ota_finish(c->port->ctx, true) != 0) {
+        c->port->ota_finish(c->port->ctx, false);
+        send_error(c, s, seq, ERR_FLASH, SMART_PROP_NONE);
+        return;
+    }
+    send_simple(c, s, MSG_ACK, seq);
+}
+#endif
+
 #if SMART_ENABLE_SECURE
 static void on_pair(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r);
 static void on_unpair(smart_core_t *c, uint8_t s, uint8_t seq, rbuf_t *r);
@@ -541,6 +679,11 @@ static void handle_message(smart_core_t *c, uint8_t s, const uint8_t *raw, size_
 #if SMART_ENABLE_SECURE
     case MSG_PAIR: on_pair(c, s, seq, &r); break;
     case MSG_UNPAIR: on_unpair(c, s, seq, &r); break;
+#endif
+#if SMART_ENABLE_OTA
+    case MSG_OTA_BEGIN: on_ota_begin(c, s, seq, &r); break;
+    case MSG_OTA_DATA: on_ota_data(c, s, seq, &r); break;
+    case MSG_OTA_END: on_ota_end(c, s, seq, &r); break;
 #endif
     default: send_error(c, s, seq, ERR_UNKNOWN_TYPE, SMART_PROP_NONE); break;
     }
@@ -624,6 +767,10 @@ static void drop_session(smart_core_t *c, uint8_t s)
         return;
     ss->open = false;
     wipe_session_secrets(ss);
+#if SMART_ENABLE_OTA
+    if (c->ota.active && c->ota.session == s)
+        ota_abort(c);
+#endif
     if (c->port && c->port->close)
         c->port->close(c->port->ctx, s);
 }
@@ -856,6 +1003,10 @@ void smart_init(smart_core_t *c, const smart_config_t *cfg)
     c->user = cfg->user;
 #if SMART_ENABLE_SECURE
     c->on_pairing = cfg->on_pairing;
+#endif
+#if SMART_ENABLE_OTA
+    c->ota_key = cfg->ota_key;
+    c->security_version = cfg->security_version;
 #endif
 }
 
@@ -1137,6 +1288,10 @@ void smart_session_close(smart_core_t *c, uint8_t session)
     if (session >= SMART_MAX_SESSIONS)
         return;
     c->sessions[session].open = false;
+#if SMART_ENABLE_OTA
+    if (c->ota.active && c->ota.session == session)
+        ota_abort(c);
+#endif
 #if SMART_ENABLE_SECURE
     wipe_session_secrets(&c->sessions[session]);
 #endif

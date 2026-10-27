@@ -32,6 +32,10 @@ from typing import Any
 PROTO_VERSION = 2
 
 HELLO, DESCRIBE, GET, SET, PING, PAIR, UNPAIR = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+OTA_BEGIN, OTA_DATA, OTA_END = 0x08, 0x09, 0x0A
+MANIFEST_LEN = 212
+OTA_WINDOW = 8  # OTA_DATA requests in flight
+INFO_HAS_KEY, INFO_OTA = 0x01, 0x02
 INFO, PROP, VALUES, ACK, EVENT, PONG, ERROR = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xEE
 
 T_BOOL, T_U8, T_U16, T_I32, T_ENUM, T_RGB, T_STR, T_ACTION = range(1, 9)
@@ -47,6 +51,9 @@ ERRORS = {
     6: "forbidden on this transport",
     7: "unsupported protocol version",
     8: "the device's list of paired hosts is full",
+    9: "image refused: not signed with the device's key, another model, or older than the installed firmware",
+    10: "another host is updating the device",
+    11: "the device couldn't store the image",
 }
 
 # frame kinds on an untrusted (secure) session
@@ -385,6 +392,8 @@ class DeviceInfo:
     model: str
     firmware: str
     public_key: bytes | None = None
+    max_payload: int = 240
+    ota: bool = False  # takes signed firmware updates
 
 
 @dataclass(frozen=True)
@@ -465,8 +474,12 @@ def parse_info(p: bytes) -> DeviceInfo:
     device_id, pos = _read_str(p, 4)
     model, pos = _read_str(p, pos)
     firmware, pos = _read_str(p, pos)
-    key = p[pos : pos + 32] if len(p) - pos >= 32 else None
-    return DeviceInfo(proto, count, model_id, device_id, model, firmware, key)
+    max_payload, flags = 240, 0
+    if len(p) - pos >= 3:
+        max_payload, flags = struct.unpack_from("<HB", p, pos)
+        pos += 3
+    key = p[pos : pos + 32] if flags & INFO_HAS_KEY and len(p) - pos >= 32 else None
+    return DeviceInfo(proto, count, model_id, device_id, model, firmware, key, max_payload, bool(flags & INFO_OTA))
 
 
 def parse_prop(p: bytes) -> Prop:
@@ -822,6 +835,40 @@ class SmartDevice:
         if self.secure and not host_key:
             raise SmartError("over the network a host can only unpair itself")
         await self._request(UNPAIR, payload)
+
+    async def update(self, image: bytes, progress: Callable[[int, int], None] | None = None) -> None:
+        """Send a signed image (firmware + manifest, see smartsign.py). The
+        device checks the signature, model and hash, installs it and reboots:
+        the connection drops right after."""
+        if not self.info.ota:
+            raise SmartError("this device doesn't take firmware updates")
+        if len(image) <= MANIFEST_LEN or image[-MANIFEST_LEN:][:8] != b"SMARTFW1":
+            raise SmartError("not a signed image: sign it with smartsign.py first")
+        firmware, manifest = image[:-MANIFEST_LEN], image[-MANIFEST_LEN:]
+        if struct.unpack_from("<I", manifest, 16)[0] != len(firmware):
+            raise SmartError("the image doesn't match its manifest")
+        await self._request(OTA_BEGIN, manifest, timeout=15)  # the device may erase flash here
+        chunk = max(16, min(self.info.max_payload, 240) - 4)
+        # Up to OTA_WINDOW chunks in flight: the link keeps them in order, and
+        # the device refuses any chunk that doesn't follow the previous one.
+        in_flight: list[asyncio.Task] = []
+        try:
+            for off in range(0, len(firmware), chunk):
+                payload = struct.pack("<I", off) + firmware[off : off + chunk]
+                in_flight.append(asyncio.ensure_future(self._request(OTA_DATA, payload, timeout=10)))
+                await asyncio.sleep(0)  # let it write now, in order
+                if len(in_flight) >= OTA_WINDOW:
+                    await in_flight.pop(0)
+                if progress:
+                    progress(max(0, off + chunk - len(in_flight) * chunk), len(firmware))
+            for task in in_flight:
+                await task
+        finally:
+            for task in in_flight:
+                task.cancel()
+        if progress:
+            progress(len(firmware), len(firmware))
+        await self._request(OTA_END, timeout=30)
 
     def prop(self, name: str) -> Prop:
         """The property called `name`; SmartError if there's none."""

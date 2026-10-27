@@ -44,14 +44,15 @@ def test_framing():
 
 
 class Emulator:
-    def __init__(self, path: str, pairing_seconds: int = 0) -> None:
+    def __init__(self, path: str, pairing_seconds: int = 0, env: dict | None = None) -> None:
         self.path = path
         self.pairing = pairing_seconds
+        self.env = env
         self.lines: list[str] = []
 
     async def __aenter__(self):
         args = [self.path, "0"] + ([str(self.pairing)] if self.pairing else [])
-        self.proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE)
+        self.proc = await asyncio.create_subprocess_exec(*args, stdout=subprocess.PIPE, env=self.env)
         self.port = int((await self.proc.stdout.readline()).decode().split()[1])
         self._reader = asyncio.create_task(self._read())
         return self
@@ -238,6 +239,56 @@ async def run_serial(emulator: str) -> None:
         os.close(slave)
 
 
+async def run_ota(emulator: str) -> None:
+    """Images signed in Python (smartsign) checked and installed by the C core."""
+    import hashlib
+    import os
+
+    import smartsign
+
+    seed, other = os.urandom(32), os.urandom(32)
+    pub = smartsign.public_key(seed)
+    firmware = os.urandom(20000)
+    async with Emulator(emulator, env=dict(os.environ, SMART_OTA_KEY=pub.hex())) as emu:
+        usb = await emu.usb()
+        me = HostIdentity.create()
+        await usb.pair(me)
+        net = await emu.net(me)
+        try:
+            check(net.info.ota and net.info.max_payload == 240, f"INFO: {net.info}")
+            for image, what in ((smartsign.sign(firmware, other, 1, 2), "another key"),
+                                (smartsign.sign(firmware, seed, 2, 2), "another model"),
+                                (smartsign.sign(firmware, seed, 1, 1), "older security version")):
+                try:
+                    await net.update(image)
+                    check(False, f"image with {what} installed")
+                except SmartError as err:
+                    check(err.code == 9, f"{what}: {err}")
+
+            good = smartsign.sign(firmware, seed, 1, 2, "2.1.0")
+            done = []
+            await net.update(good, lambda d, t: done.append((d, t)))
+            await asyncio.sleep(0.1)
+            want = f"OTA installed {len(good)} {hashlib.sha512(firmware).hexdigest()[:16]}"
+            check(want in emu.lines, f"installed: {emu.lines}")
+            check(done[-1] == (len(firmware), len(firmware)), "progress reaches 100%")
+            check(all(a[0] <= b[0] for a, b in zip(done, done[1:])), "progress never goes back")
+
+            # smartsign itself: round trip, and tampering after signing is caught
+            check(smartsign.verify(good, pub).version == "2.1.0", "verify")
+            tampered = bytearray(good)
+            tampered[100] ^= 1
+            for bad, what in ((bytes(tampered), "tampered"), (good, "wrong key")):
+                try:
+                    smartsign.verify(bad, smartsign.public_key(other) if what == "wrong key" else pub)
+                    check(False, f"{what} image verified")
+                except smartsign.SignError:
+                    pass
+        finally:
+            await net.close()
+            await usb.close()
+
+
 async def run_targets(emulator: str) -> None:
     async with Emulator(emulator) as emu:
         await expect_error(connect(f"tcp:127.0.0.1:{emu.port}"), SmartError, None, "tcp without identity")
@@ -249,6 +300,7 @@ if __name__ == "__main__":
     test_framing()
     asyncio.run(run(sys.argv[1]))
     asyncio.run(run_pairing_window(sys.argv[1]))
+    asyncio.run(run_ota(sys.argv[1]))
     asyncio.run(run_targets(sys.argv[1]))
     if sys.platform != "win32":
         asyncio.run(run_serial(sys.argv[1]))

@@ -28,6 +28,14 @@ menu "smart-core"
             Untrusted sessions (TCP, ...) must complete a Noise handshake as a
             paired host. Turn off only for devices that never sit on a network.
 
+    config SMART_ENABLE_OTA
+        bool "Signed firmware updates over the protocol"
+        default y
+        depends on SMART_ENABLE_SECURE
+        help
+            OTA_BEGIN / OTA_DATA / OTA_END: a host sends a firmware image with
+            a manifest signed by the key the device trusts (Ed25519).
+
     config SMART_MAX_PAIRED
         int "Maximum number of paired hosts"
         range 1 32

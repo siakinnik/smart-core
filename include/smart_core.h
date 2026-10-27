@@ -72,7 +72,46 @@ typedef struct {
     // Drop the transport behind an untrusted session the core gave up on
     // (failed handshake, unpaired host). The session is already closed.
     void (*close)(void *ctx, uint8_t session);
+
+    // Firmware updates (all optional; without them the device refuses OTA).
+    // The core checks the signature, the model and the hash; the port only
+    // writes. Bytes arrive in order, from offset 0 to the image size, then
+    // the manifest right after the image. Return 0 on success.
+    int (*ota_begin)(void *ctx, uint32_t total_size);  // image + manifest
+    int (*ota_write)(void *ctx, uint32_t offset, const uint8_t *data, size_t len);
+    // ok: everything is written and verified, make it the next boot image
+    // (the device reboots when it likes, e.g. right after the ACK has left).
+    // !ok: throw the partial image away.
+    int (*ota_finish)(void *ctx, bool ok);
 } smart_port_t;
+
+// ---------- signed firmware images ----------
+// A signed image is the firmware followed by this manifest (little-endian):
+//   magic "SMARTFW1" (8) | model_id (2) | reserved (2) | security_version (4)
+//   | image size (4) | version string, NUL-padded (32) | SHA-512 of the image (64)
+//   | signer Ed25519 public key (32) | Ed25519 signature of all of the above (64)
+#define SMART_MANIFEST_LEN 212
+
+typedef struct {
+    uint16_t model_id;
+    uint32_t security_version;
+    uint32_t image_size;
+    char version[33];
+    uint8_t hash[64];
+    uint8_t signer[32];
+} smart_manifest_t;
+
+// Parse a manifest and check its signature against the key inside it.
+// Doesn't say whether that key is trusted: compare `signer` for that.
+bool smart_manifest_parse(const uint8_t raw[SMART_MANIFEST_LEN], smart_manifest_t *out);
+
+// Streaming SHA-512 (images are hashed as they arrive).
+typedef struct {
+    uint64_t opaque[28];
+} smart_hash_t;
+void smart_hash_init(smart_hash_t *h);
+void smart_hash_update(smart_hash_t *h, const uint8_t *data, size_t len);
+void smart_hash_final(smart_hash_t *h, uint8_t out[64]);
 
 // ---------- core instance ----------
 typedef struct smart_core smart_core_t;
@@ -161,6 +200,18 @@ struct smart_core {
     uint8_t tx_sec[SMART_MAX_RAW];
 #endif
 
+#if SMART_ENABLE_OTA
+    const uint8_t *ota_key;
+    uint32_t security_version;
+    struct {
+        bool active;
+        uint8_t session;     // only the session that started it may continue it
+        uint32_t size, offset;
+        smart_hash_t hash;
+        uint8_t manifest[SMART_MANIFEST_LEN];
+    } ota;
+#endif
+
     // transmit buffers: TYPE SEQ PAYLOAD CRC, and its COBS form wrapped in zeros
     uint8_t tx_raw[SMART_MAX_RAW];
     uint8_t tx_enc[SMART_MAX_PACKET + 2];
@@ -175,6 +226,12 @@ typedef struct {
     smart_change_cb on_change;
     void *user;
     smart_pairing_cb on_pairing;  // may be NULL
+    // OTA: the Ed25519 public key update images must be signed with (32
+    // bytes; NULL = no updates over the protocol), and this firmware's
+    // security version: images with a lower one are refused, so an update
+    // can't bring back a version with a known hole.
+    const uint8_t *ota_key;
+    uint32_t security_version;
 } smart_config_t;
 
 void smart_init(smart_core_t *core, const smart_config_t *cfg);

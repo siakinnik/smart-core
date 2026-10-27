@@ -80,18 +80,24 @@ authorisation.
 | `0x05` | `PING`     | —                                         | `PONG`           |
 | `0x06` | `PAIR`     | host static key (32 bytes)                | `ACK`; trusted transport only |
 | `0x07` | `UNPAIR`   | host static key (32), or nothing = every host | `ACK`        |
+| `0x08` | `OTA_BEGIN`| manifest (212 bytes, see [Firmware updates](#firmware-updates)) | `ACK` |
+| `0x09` | `OTA_DATA` | offset (u32), image bytes                 | `ACK`            |
+| `0x0A` | `OTA_END`  | —                                         | `ACK`, then the device reboots into the new firmware |
 
 ### Device → host
 
 | Type   | Name     | Payload                                                       |
 |--------|----------|---------------------------------------------------------------|
-| `0x81` | `INFO`   | `proto`, `prop_count`, `model_id` (u16), device id (str), model (str), firmware (str), device static key (32 bytes, if the device does secure sessions) |
+| `0x81` | `INFO`   | `proto`, `prop_count`, `model_id` (u16), device id (str), model (str), firmware (str), `max_payload` (u16), `flags` (u8), device static key (32 bytes, if `flags` bit 0) |
 | `0x82` | `PROP`   | `id`, `type`, `flags`, name (str), type metadata              |
 | `0x83` | `VALUES` | `id`, value, `id`, value, ...                                 |
 | `0x84` | `ACK`    | —                                                             |
 | `0x85` | `EVENT`  | same as `VALUES`; sent with `SEQ = 0`                         |
 | `0x86` | `PONG`   | —                                                             |
 | `0xEE` | `ERROR`  | `code`, `id` (`FF` when it's not about a property)            |
+
+`INFO` flags: bit 0 = a device static key follows (secure sessions), bit 1 =
+the device takes signed firmware updates.
 
 Type metadata in `PROP`:
 
@@ -130,6 +136,9 @@ Type metadata in `PROP`:
 | `6`  | `FORBIDDEN`    | `LOCAL` over an untrusted transport, or `GET` of something unreadable (secret, action) |
 | `7`  | `BAD_PROTO`    | `HELLO` with a version the device can't speak   |
 | `8`  | `PAIRING_FULL` | `PAIR` but the device's list of hosts is full   |
+| `9`  | `BAD_IMAGE`    | Update refused: not signed with the device's key, another model, an older security version, or the image doesn't match its hash |
+| `10` | `BUSY`         | Another host is updating the device             |
+| `11` | `FLASH`        | The device couldn't store the update            |
 
 ## Models and property names
 
@@ -163,6 +172,40 @@ and a debugging aid; small devices may leave it out and answer it with
   of existing ones never change. So an older database entry still drives a
   newer firmware correctly, and the host can `DESCRIBE` the ids it doesn't
   know (`INFO.prop_count` is larger than the database says).
+
+## Firmware updates
+
+A signed image is the firmware followed by a 212-byte manifest
+(little-endian):
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0   | 8  | `SMARTFW1` |
+| 8   | 2  | `model_id` |
+| 10  | 2  | reserved, 0 |
+| 12  | 4  | `security_version` |
+| 16  | 4  | firmware size in bytes |
+| 20  | 32 | firmware version, UTF-8, NUL-padded |
+| 52  | 64 | SHA-512 of the firmware |
+| 116 | 32 | signer's Ed25519 public key |
+| 148 | 64 | Ed25519 signature (RFC 8032) of bytes 0–147 |
+
+- `OTA_BEGIN` carries the manifest. The device accepts it only if the
+  signature is valid, the signer is the key built into its firmware, the
+  model is its own and `security_version` is not lower than its own. Then
+  it prepares a slot for the image.
+- `OTA_DATA` chunks follow in order: each must start where the previous one
+  ended. A host may send several before waiting for their `ACK`s.
+- `OTA_END`: the device checks that the SHA-512 of everything it received
+  matches the manifest, stores the manifest right after the image (so the
+  slot holds a signed image again), makes it the next boot image, replies
+  `ACK` and reboots.
+- One update at a time; it's bound to the session that started it and
+  aborted if that session ends. Any paired host (or a trusted session) may
+  send an update: the signature, not the session, is what makes it
+  acceptable, so even a compromised host can't install foreign firmware.
+- Rolling back after a bad update (a crash or hang soon after it boots) is
+  the device firmware's job; see its documentation.
 
 ## Discovery
 

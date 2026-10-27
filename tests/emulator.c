@@ -9,6 +9,10 @@
 // from 127.0.0.2 counts as trusted ("USB"): plain packets, LOCAL properties,
 // PAIR. With pairing_seconds the pairing window opens at start. Pairing
 // events are printed as "PAIRING <event>". Ctrl+C to stop.
+//
+// OTA: with SMART_OTA_KEY=<64 hex digits> (an Ed25519 public key) in the
+// environment the emulator takes signed updates into memory and prints
+// "OTA installed <bytes> <first 16 hex digits of the image's SHA-512>".
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -60,6 +64,49 @@ static void em_close(void *ctx, uint8_t session)
     }
 }
 
+static uint8_t ota_buf[1 << 20];
+static uint32_t ota_total, ota_written;
+
+static int em_ota_begin(void *ctx, uint32_t total)
+{
+    (void)ctx;
+    if (total > sizeof(ota_buf))
+        return -1;
+    ota_total = total;
+    ota_written = 0;
+    return 0;
+}
+
+static int em_ota_write(void *ctx, uint32_t offset, const uint8_t *data, size_t len)
+{
+    (void)ctx;
+    if (offset != ota_written || offset + len > ota_total)
+        return -1;
+    memcpy(ota_buf + offset, data, len);
+    ota_written += (uint32_t)len;
+    return 0;
+}
+
+static int em_ota_finish(void *ctx, bool ok)
+{
+    (void)ctx;
+    if (!ok) {
+        printf("OTA aborted\n");
+    } else {
+        uint8_t hash[64];
+        smart_hash_t h;
+        smart_hash_init(&h);
+        smart_hash_update(&h, ota_buf, ota_total - SMART_MANIFEST_LEN);
+        smart_hash_final(&h, hash);
+        printf("OTA installed %u ", (unsigned)ota_total);
+        for (int i = 0; i < 8; i++)
+            printf("%02x", hash[i]);
+        printf("\n");
+    }
+    fflush(stdout);
+    return 0;
+}
+
 static void on_pairing(smart_core_t *c, smart_pairing_event_t ev, void *user)
 {
     (void)c; (void)user;
@@ -90,9 +137,19 @@ int main(int argc, char **argv)
 {
     int port = argc > 1 ? atoi(argv[1]) : 0;
     int pairing_s = argc > 2 ? atoi(argv[2]) : 0;
-    static const smart_port_t smart_port = { NULL, em_millis, em_send, NULL, NULL, em_random, em_close };
+    static const smart_port_t smart_port = { NULL, em_millis, em_send, NULL, NULL, em_random, em_close,
+                                             em_ota_begin, em_ota_write, em_ota_finish };
     static smart_core_t core;
-    smart_config_t cfg = { &smart_port, "02:00:00:00:00:01", 1, "lumenc3", "emulator", on_change, NULL, on_pairing };
+    static uint8_t ota_key[32];
+    const char *key_hex = getenv("SMART_OTA_KEY");
+    bool have_key = key_hex && strlen(key_hex) == 64;
+    for (int i = 0; have_key && i < 32; i++) {
+        unsigned v;
+        have_key = sscanf(key_hex + 2 * i, "%2x", &v) == 1;
+        ota_key[i] = (uint8_t)v;
+    }
+    smart_config_t cfg = { &smart_port, "02:00:00:00:00:01", 1, "lumenc3", "emulator", on_change, NULL, on_pairing,
+                           have_key ? ota_key : NULL, 2 };
     smart_init(&core, &cfg);
 
     smart_prop_bool(&core, "light.power", SMART_F_RW | SMART_F_PERSIST, true);

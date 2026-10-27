@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "monocypher-ed25519.h"
 #include "monocypher.h"
 #include "smart_core.h"
 
@@ -1067,6 +1068,227 @@ static void test_keys_persist(void)
     CHECK(hosts[t].reject == 4 && hosts[t].closed);
 }
 
+
+// ---------- firmware updates ----------
+static struct {
+    uint8_t image[8192];
+    uint32_t total, written;
+    int begins, finishes;
+    bool finished_ok;
+} flash;
+
+static int mock_ota_begin(void *ctx, uint32_t total)
+{
+    (void)ctx;
+    if (total > sizeof(flash.image))
+        return -1;
+    flash.total = total;
+    flash.written = 0;
+    flash.begins++;
+    return 0;
+}
+
+static int mock_ota_write(void *ctx, uint32_t offset, const uint8_t *data, size_t len)
+{
+    (void)ctx;
+    CHECK(offset == flash.written && offset + len <= flash.total);  // strictly in order
+    memcpy(flash.image + offset, data, len);
+    flash.written += (uint32_t)len;
+    return 0;
+}
+
+static int mock_ota_finish(void *ctx, bool ok)
+{
+    (void)ctx;
+    flash.finishes++;
+    flash.finished_ok = ok;
+    return 0;
+}
+
+static const smart_port_t ota_port = { NULL, mock_millis, mock_send, mock_read, mock_write, mock_random, mock_close,
+                                       mock_ota_begin, mock_ota_write, mock_ota_finish };
+
+static uint8_t sign_sk[2][64], sign_pk[2][32];  // [0] the device's update key, [1] somebody else's
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    for (int i = 0; i < 4; i++)
+        p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void make_manifest(uint8_t out[SMART_MANIFEST_LEN], const uint8_t *image, uint32_t len,
+                          uint16_t model_id, uint32_t security_version, int key)
+{
+    memset(out, 0, SMART_MANIFEST_LEN);
+    memcpy(out, "SMARTFW1", 8);
+    out[8] = (uint8_t)model_id;
+    out[9] = (uint8_t)(model_id >> 8);
+    put32(out + 12, security_version);
+    put32(out + 16, len);
+    memcpy(out + 20, "2.1.0", 5);
+    crypto_sha512(out + 52, image, len);
+    memcpy(out + 116, sign_pk[key], 32);
+    crypto_ed25519_sign(out + 148, sign_sk[key], out, 148);
+}
+
+static void make_ota_device(smart_core_t *c, const uint8_t *ota_key)
+{
+    n_store = 0;
+    smart_config_t cfg = { &ota_port, "8C:D0:B2:A8:62:B2", 1, "lumenc3", "2.0.0", on_change, NULL, on_pairing,
+                           ota_key, 3 };
+    smart_init(c, &cfg);
+    P_POWER = smart_prop_bool(c, "light.power", SMART_F_RW, true);
+    smart_load(c);
+    memset(&flash, 0, sizeof(flash));
+}
+
+// send an image in chunks; returns the error code of the first failure, 0 if all ACKed
+static int send_image(smart_core_t *c, uint8_t s, const uint8_t *image, uint32_t len, uint32_t chunk)
+{
+    uint8_t buf[300];
+    for (uint32_t off = 0; off < len; off += chunk) {
+        uint32_t n = len - off < chunk ? len - off : chunk;
+        put32(buf, off);
+        memcpy(buf + 4, image + off, n);
+        reset_sent();
+        send_to(c, s, 0x09, 20, buf, 4 + n);
+        packet_t *e = find(s, 0xEE);
+        if (e)
+            return e->payload[0];
+        CHECK(find(s, 0x84) != NULL);
+    }
+    return 0;
+}
+
+static int ota_begin(smart_core_t *c, uint8_t s, const uint8_t manifest[SMART_MANIFEST_LEN])
+{
+    reset_sent();
+    send_to(c, s, 0x08, 10, manifest, SMART_MANIFEST_LEN);
+    packet_t *e = find(s, 0xEE);
+    return e ? e->payload[0] : (find(s, 0x84) ? 0 : -1);
+}
+
+static int ota_end(smart_core_t *c, uint8_t s)
+{
+    reset_sent();
+    send_to(c, s, 0x0A, 30, NULL, 0);
+    packet_t *e = find(s, 0xEE);
+    return e ? e->payload[0] : (find(s, 0x84) ? 0 : -1);
+}
+
+static void test_ed25519_vector(void)
+{
+    // RFC 8032 section 7.1, TEST 1 (empty message)
+    uint8_t seed[32], pk[32], sk[64], want_pk[32], want_sig[64], sig[64];
+    hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", seed);
+    hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", want_pk);
+    hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b", want_sig);
+    crypto_ed25519_key_pair(sk, pk, seed);
+    CHECK(!memcmp(pk, want_pk, 32));
+    crypto_ed25519_sign(sig, sk, NULL, 0);
+    CHECK(!memcmp(sig, want_sig, 64));
+    CHECK(crypto_ed25519_check(sig, pk, NULL, 0) == 0);
+}
+
+static void test_ota(void)
+{
+    for (int i = 0; i < 2; i++) {
+        uint8_t seed[32];
+        memset(seed, 0x40 + i, 32);
+        crypto_ed25519_key_pair(sign_sk[i], sign_pk[i], seed);
+    }
+    static uint8_t image[3000];
+    for (size_t i = 0; i < sizeof(image); i++)
+        image[i] = (uint8_t)(i * 31 + 7);
+    uint8_t manifest[SMART_MANIFEST_LEN];
+
+    // INFO says the device takes updates
+    smart_core_t c;
+    make_ota_device(&c, sign_pk[0]);
+    uint8_t s = open_net(&c);
+    reset_sent();
+    uint8_t proto = 2;
+    send_to(&c, s, 0x01, 1, &proto, 1);
+    packet_t *info = find(s, 0x81);
+    // ... firmware str, max payload (u16), flags, device key (32)
+    CHECK(info && info->len > 35 && (info->payload[info->len - 33] & 0x03) == 0x03);
+
+    // the happy path, over a secure session: image + manifest end up in flash
+    make_manifest(manifest, image, sizeof(image), 1, 3, 0);
+    CHECK(ota_begin(&c, s, manifest) == 0 && flash.total == sizeof(image) + SMART_MANIFEST_LEN);
+    CHECK(send_image(&c, s, image, sizeof(image), 236) == 0);
+    CHECK(ota_end(&c, s) == 0);
+    CHECK(flash.finishes == 1 && flash.finished_ok);
+    CHECK(!memcmp(flash.image, image, sizeof(image)));
+    CHECK(!memcmp(flash.image + sizeof(image), manifest, SMART_MANIFEST_LEN));
+    smart_manifest_t m;
+    CHECK(smart_manifest_parse(flash.image + sizeof(image), &m) && m.image_size == sizeof(image));
+    CHECK(m.security_version == 3 && !strcmp(m.version, "2.1.0") && m.model_id == 1);
+
+    // refused manifests: other signer, other model, older security version, broken signature
+    make_manifest(manifest, image, sizeof(image), 1, 3, 1);
+    CHECK(ota_begin(&c, s, manifest) == 9);
+    make_manifest(manifest, image, sizeof(image), 2, 3, 0);
+    CHECK(ota_begin(&c, s, manifest) == 9);
+    make_manifest(manifest, image, sizeof(image), 1, 2, 0);
+    CHECK(ota_begin(&c, s, manifest) == 9);
+    make_manifest(manifest, image, sizeof(image), 1, 3, 0);
+    manifest[12] = 4;  // raise the security version after signing
+    CHECK(ota_begin(&c, s, manifest) == 9);
+    CHECK(flash.begins == 1);  // none of those touched the flash
+    make_manifest(manifest, image, sizeof(image), 1, 4, 0);  // newer is fine
+    CHECK(ota_begin(&c, s, manifest) == 0);
+
+    // out of order: a gap and a repeat are refused
+    uint8_t chunk[4 + 10];
+    put32(chunk, 10);
+    memcpy(chunk + 4, image + 10, 10);
+    reset_sent();
+    send_to(&c, s, 0x09, 2, chunk, sizeof(chunk));
+    CHECK(find(s, 0xEE) && find(s, 0xEE)->payload[0] == 4);
+    CHECK(send_image(&c, s, image, 100, 100) == 0);
+    put32(chunk, 0);
+    reset_sent();
+    send_to(&c, s, 0x09, 3, chunk, sizeof(chunk));
+    CHECK(find(s, 0xEE) && find(s, 0xEE)->payload[0] == 4);
+    // END before everything arrived
+    CHECK(ota_end(&c, s) == 4);
+
+    // a tampered image: every chunk is accepted, END finds the hash wrong
+    static uint8_t evil[3000];
+    memcpy(evil, image, sizeof(image));
+    evil[1500] ^= 0x01;
+    flash.finishes = 0;
+    CHECK(ota_begin(&c, s, manifest) == 0);
+    CHECK(flash.finishes == 1 && !flash.finished_ok);  // the half-written one was thrown away
+    CHECK(send_image(&c, s, evil, sizeof(evil), 236) == 0);
+    CHECK(ota_end(&c, s) == 9);
+    CHECK(flash.finishes == 2 && !flash.finished_ok);
+
+    // one update at a time; it dies with its session
+    CHECK(ota_begin(&c, s, manifest) == 0);
+    uint8_t u = open_usb(&c);
+    CHECK(ota_begin(&c, u, manifest) == 10);  // BUSY
+    // ... and it can't slip data into somebody else's update either
+    put32(chunk, 0);
+    memcpy(chunk + 4, image, 10);
+    reset_sent();
+    send_to(&c, u, 0x09, 4, chunk, sizeof(chunk));
+    CHECK(find(u, 0xEE) && find(u, 0xEE)->payload[0] == 4 && flash.written == 0);
+    flash.finishes = 0;
+    smart_session_close(&c, s);
+    CHECK(flash.finishes == 1 && !flash.finished_ok);
+    CHECK(ota_begin(&c, u, manifest) == 0);  // over USB it works the same
+    CHECK(send_image(&c, u, image, sizeof(image), 200) == 0 && ota_end(&c, u) == 0 && flash.finished_ok);
+
+    // without a key the device takes no updates at all
+    smart_core_t d;
+    make_ota_device(&d, NULL);
+    uint8_t t = open_usb(&d);
+    CHECK(ota_begin(&d, t, manifest) == 1);
+    CHECK(flash.begins == 0);
+}
+
 int main(void)
 {
     make_host_keys();
@@ -1087,6 +1309,8 @@ int main(void)
     test_pair_unpair_messages();
     test_tampering();
     test_keys_persist();
+    test_ed25519_vector();
+    test_ota();
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

@@ -15,6 +15,8 @@
     smartctl.py tcp:192.168.0.184 unpair         # forget this computer
     smartctl.py serial:COM5 unpair --all         # USB: forget every host
 
+    smartctl.py tcp:192.168.0.184 update lumenc3-2.1.0.simg   # signed firmware (smartsign.py)
+
     smartctl.py ble scan                          # devices in pairing mode, over Bluetooth
     smartctl.py ble:LumenC3-62B2 setup --ssid Home   # pair + put it on Wi-Fi (asks the password)
 
@@ -159,6 +161,7 @@ async def cmd_info(dev: SmartDevice, args) -> None:
         paired = "paired with this computer" if me.knows(i.public_key) else "not paired with this computer"
         print(f"device key {fingerprint(i.public_key)} ({paired})")
     print(f"link       {'encrypted (Noise)' if dev.secure else 'plain, trusted (USB)'}")
+    print(f"updates    {'signed images (smartctl.py ... update)' if i.ota else 'no'}")
     print(f"this host  {fingerprint(me.public)}")
     print()
     print(f"{'id':<5}{'name':<20}{'type':<8}{'flags':<7}{'value':<22}range")
@@ -289,9 +292,27 @@ async def cmd_setup(dev: SmartDevice, args) -> None:
     raise SmartError("setup cancelled: the device forgot the network; run setup again while its pairing window is open")
 
 
+async def cmd_update(dev: SmartDevice, args) -> None:
+    image = args.image.read_bytes()
+    start = time.monotonic()
+
+    shown = -1
+
+    def progress(done: int, total: int) -> None:
+        nonlocal shown
+        percent = done * 100 // total
+        if percent != shown:  # redraw once per percent, not per chunk
+            shown = percent
+            print(f"\r  {percent:3d}%  {done // 1024} / {total // 1024} KB", end="", flush=True)
+
+    print(f"updating {dev.info.model} {dev.info.device_id} from {dev.info.firmware} ...")
+    await dev.update(image, progress)
+    print(f"\ninstalled in {time.monotonic() - start:.0f} s; the device reboots into it now")
+
+
 COMMANDS = {
     "info": cmd_info, "get": cmd_get, "set": cmd_set, "trigger": cmd_trigger, "watch": cmd_watch,
-    "pair": cmd_pair, "unpair": cmd_unpair, "setup": cmd_setup,
+    "pair": cmd_pair, "unpair": cmd_unpair, "setup": cmd_setup, "update": cmd_update,
 }
 
 
@@ -328,6 +349,8 @@ def main() -> int:
     p.add_argument("name")
     sub.add_parser("watch", help="print changes as they happen")
     sub.add_parser("pair", help="pair this computer: over USB any time, over the network while the window is open")
+    p = sub.add_parser("update", help="install a signed firmware image (from smartsign.py)")
+    p.add_argument("image", type=Path)
     sub.add_parser("scan", help="BLE: list devices in pairing mode (target: ble)")
     p = sub.add_parser("setup", help="pair a device in pairing mode and put it on Wi-Fi")
     p.add_argument("--ssid", required=True)
