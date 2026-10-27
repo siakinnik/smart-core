@@ -201,3 +201,9 @@ For sanitizers, add `-DCMAKE_C_FLAGS="-fsanitize=address,undefined"`.
 
 GPL-3.0-or-later, see [LICENSE](LICENSE). Firmware that includes the core
 is GPL too. Monocypher is used under CC0-1.0; see [NOTICE](NOTICE).
+
+## Contributing
+
+Pull requests are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md). Before
+the first one is merged, its author signs the [CLA](CLA.md) with one comment
+in the pull request.
