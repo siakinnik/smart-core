@@ -6,6 +6,7 @@
     smartctl.py serial:COM5 info
     smartctl.py serial:COM5 pair                 # USB: this computer may now use the network
     smartctl.py tcp:192.168.0.184 pair           # or over Wi-Fi while the pairing window is open
+    smartctl.py serial:COM5 pair --host-key 9f3c...   # USB: pair another machine (Home Assistant)
     smartctl.py tcp:192.168.0.184 get
     smartctl.py serial:/dev/ttyACM0 get light.brightness light.color
     smartctl.py serial:COM5 set light.effect=fire light.color=#ff3c00 light.brightness=0x80
@@ -210,6 +211,16 @@ async def cmd_watch(dev: SmartDevice, _args) -> None:
 
 
 async def cmd_pair(dev: SmartDevice, args) -> None:
+    if args.host_key:
+        # another machine's key (e.g. Home Assistant shows it while adding a device)
+        try:
+            host_key = bytes.fromhex(args.host_key.replace(":", "").strip())
+        except ValueError:
+            raise SmartError("--host-key: 64 hex digits") from None
+        device_key = await dev.pair_host(host_key)
+        print(f"paired host {fingerprint(host_key)} with {dev.info.model} {dev.info.device_id}")
+        print(f"device key {fingerprint(device_key)}  {device_key.hex()}")
+        return
     # over the network the pairing already happened in connect(pairing=True)
     if not dev.secure:
         await dev.pair(args.me)
@@ -348,7 +359,8 @@ def main() -> int:
     p = sub.add_parser("trigger", help="run an action")
     p.add_argument("name")
     sub.add_parser("watch", help="print changes as they happen")
-    sub.add_parser("pair", help="pair this computer: over USB any time, over the network while the window is open")
+    p = sub.add_parser("pair", help="pair this computer: over USB any time, over the network while the window is open")
+    p.add_argument("--host-key", metavar="HEX", help="USB: pair another host's key instead (e.g. Home Assistant's)")
     p = sub.add_parser("update", help="install a signed firmware image (from smartsign.py)")
     p.add_argument("image", type=Path)
     sub.add_parser("scan", help="BLE: list devices in pairing mode (target: ble)")

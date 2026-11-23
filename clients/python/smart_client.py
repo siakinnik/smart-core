@@ -195,6 +195,15 @@ class RejectedError(SmartError):
     """The device refused the secure session (code: see REJECTS)."""
 
 
+class UnknownDeviceError(SmartError):
+    """The device's static key isn't the one this host paired with (a new
+    device, or the same one after a factory reset)."""
+
+    def __init__(self, message: str, key: bytes) -> None:
+        super().__init__(message)
+        self.key = key
+
+
 # ---------- Noise_XX_25519_ChaChaPoly_BLAKE2b, initiator side ----------
 
 PROLOGUE = b"smart-core/2"
@@ -757,8 +766,8 @@ class SmartDevice:
         self.peer_key = hs.rs
         if not pairing and not identity.knows(hs.rs):
             # don't even finish the handshake with an impostor
-            raise SmartError(
-                f"unknown device key {fingerprint(hs.rs)}: pair with it first (smartctl ... pair)"
+            raise UnknownDeviceError(
+                f"unknown device key {fingerprint(hs.rs)}: pair with it first (smartctl ... pair)", hs.rs
             )
         msg3, self._tx, self._rx = hs.write3()
         self._handshake = None
@@ -819,12 +828,21 @@ class SmartDevice:
 
     async def pair(self, identity: HostIdentity) -> None:
         """Over a trusted session (USB): make the device trust `identity`."""
+        await self.pair_host(identity.public)
+        identity.remember(self.info.device_id, self.info.public_key)
+
+    async def pair_host(self, host_key: bytes) -> bytes:
+        """Over a trusted session (USB): make the device trust the host with
+        static key `host_key` (another machine, e.g. a Home Assistant server).
+        Returns the device's static key, which that host should expect."""
         if self.secure:
             raise SmartError("pairing a new host needs a trusted connection (USB)")
-        await self._request(PAIR, identity.public)
+        if len(host_key) != 32:
+            raise SmartError("a host key is 32 bytes")
         if self.info.public_key is None:
             raise SmartError("the device has no key (no secure sessions)")
-        identity.remember(self.info.device_id, self.info.public_key)
+        await self._request(PAIR, host_key)
+        return self.info.public_key
 
     async def unpair(self, host_key: bytes | None = None) -> None:
         """Remove a host from the device: `host_key`, or every host (trusted session only).

@@ -193,6 +193,7 @@ pip install cryptography pyserial bleak   # bleak only for BLE
 
 python smartctl.py serial:COM5 info                     # every property
 python smartctl.py serial:COM5 pair                     # pair this computer over USB
+python smartctl.py serial:COM5 pair --host-key 9f3c...  # or another machine (Home Assistant)
 python smartctl.py tcp:192.168.0.184 set light.brightness=0x80
 python smartctl.py tcp:lumenc3-62b2.local watch         # changes as they happen
 python smartctl.py ble scan                             # devices in pairing mode

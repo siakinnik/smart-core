@@ -21,6 +21,7 @@ from smart_client import (
     RejectedError,
     SmartDevice,
     SmartError,
+    UnknownDeviceError,
     build_packet,
     cobs_decode,
     cobs_encode,
@@ -97,6 +98,17 @@ async def run(emulator: str) -> None:
         # and without pairing=True the client won't even finish a handshake with an unknown device
         err = await expect_error(emu.net(me), SmartError, None, "unknown device key")
         check("unknown device key" in str(err), f"client refuses unknown device: {err}")
+        check(isinstance(err, UnknownDeviceError) and len(err.key) == 32, "UnknownDeviceError carries the key")
+
+        # another machine's key, paired over USB (smartctl pair --host-key)
+        other = HostIdentity.create()
+        device_key = await usb.pair_host(other.public)
+        check(device_key == usb.info.public_key, "pair_host returns the device key")
+        other.remember(usb.info.device_id, device_key)
+        net = await emu.net(other)
+        check(net.secure, "the other host gets in")
+        await net.close()
+        await expect_error(usb.pair_host(b"short"), SmartError, None, "bad host key")
 
         await usb.pair(me)
         check(me.devices == {usb.info.device_id: usb.info.public_key}, "device remembered")
